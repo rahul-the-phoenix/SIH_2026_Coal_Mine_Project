@@ -13,7 +13,7 @@ const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 19800;
 
 // Pin Definitions
-#define KNOCK_PIN 4
+#define KNOCK_PIN 12
 #define TILT_PIN 5
 #define LED_PIN 2
 #define BUZZER_PIN 13   // active buzzer module - change if wired to a different pin
@@ -98,8 +98,8 @@ bool buzzerBeeping = false;
 bool buzzerPinState = false;
 unsigned long buzzerStopAt = 0;
 unsigned long lastBuzzerToggle = 0;
-const unsigned long BUZZER_BEEP_INTERVAL = 150;   // on/off toggle speed
-const unsigned long BUZZER_ALERT_DURATION = 2500; // how long it beeps per alert
+const unsigned long BUZZER_BEEP_INTERVAL = 80;   // on/off toggle speed
+const unsigned long BUZZER_ALERT_DURATION = 4000; // how long it beeps per alert
 
 // ===== INTERRUPT =====
 void IRAM_ATTR isrKnock() {
@@ -294,44 +294,83 @@ int wrapText(String text, int maxWidth, String outLines[], int maxLines) {
 //                              OLED SCREENS
 // =====================================================================
 
+// void initOLED() {
+//   u8g2.begin();
+//   u8g2.enableUTF8Print();
+//   u8g2.clearBuffer();
+//   u8g2.setFont(u8g2_font_helvB10_tr);
+//   u8g2.drawStr(8, 26, "ALERT SYSTEM");
+//   u8g2.setFont(u8g2_font_6x10_tf);
+//   u8g2.drawStr(8, 44, "Starting up...");
+//   u8g2.sendBuffer();
+//   delay(1200);
+// }
+
 void initOLED() {
   u8g2.begin();
   u8g2.enableUTF8Print();
   u8g2.clearBuffer();
+
+  // Border around the whole screen
+  u8g2.drawFrame(0, 0, OLED_WIDTH, OLED_HEIGHT);
+
+  // Title - big & bold: "SIH 2026"
+  u8g2.setFont(u8g2_font_helvB14_tr);
+  String title = "SIH 2026";
+  int tw = u8g2.getStrWidth(title.c_str());
+  u8g2.setCursor((OLED_WIDTH - tw) / 2, 20);
+  u8g2.print(title);
+
+  // Subtitle - a bit smaller, still bold: "Bhumi Rakshha"
   u8g2.setFont(u8g2_font_helvB10_tr);
-  u8g2.drawStr(8, 26, "ALERT SYSTEM");
+  String subtitle = "Bhumi Rakshha";
+  int sw = u8g2.getStrWidth(subtitle.c_str());
+  u8g2.setCursor((OLED_WIDTH - sw) / 2, 36);
+  u8g2.print(subtitle);
+
+  // Divider line
+  u8g2.drawHLine(8, 42, OLED_WIDTH - 16);
+
+  // Starting up text below the line
   u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(8, 44, "Starting up...");
+  String startTxt = "Starting up...";
+  int stw = u8g2.getStrWidth(startTxt.c_str());
+  u8g2.setCursor((OLED_WIDTH - stw) / 2, 56);
+  u8g2.print(startTxt);
+
   u8g2.sendBuffer();
   delay(1200);
 }
 
 void oledNormalDisplay() {
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tf);
-  String topStatus = anySensorIssue() ? "Checking..." : "No Problem Found";
-  int tw = u8g2.getStrWidth(topStatus.c_str());
-  u8g2.setCursor((OLED_WIDTH - tw) / 2, 8);
-  u8g2.print(topStatus);
-  u8g2.drawHLine(0, 11, OLED_WIDTH);
-  u8g2.setFont(u8g2_font_fub17_tr);
-  String t = timeOK ? getTimeOnly() : "--:--:--";
+
+  // Time - bold monospace font so "HH:MM:SS AM/PM" always fits the width
+  u8g2.setFont(u8g2_font_9x15B_tr);
+  String t = timeOK ? getTimeOnly() : "--:--:-- --";
   int w = u8g2.getStrWidth(t.c_str());
-  u8g2.setCursor((OLED_WIDTH - w) / 2, 33);
+  u8g2.setCursor((OLED_WIDTH - w) / 2, 20);
   u8g2.print(t);
+
+  // Date - right below the time
   u8g2.setFont(u8g2_font_7x13_tf);
   String dd = timeOK ? (getDayShort() + ", " + getDateOnly()) : "Time Not Synced";
   truncateFit(dd, OLED_WIDTH - 4);
   int w2 = u8g2.getStrWidth(dd.c_str());
-  u8g2.setCursor((OLED_WIDTH - w2) / 2, 47);
+  u8g2.setCursor((OLED_WIDTH - w2) / 2, 34);
   u8g2.print(dd);
-  u8g2.drawHLine(0, 51, OLED_WIDTH);
-  u8g2.setFont(u8g2_font_6x10_tf);
-  String connTxt = getConnStatusText();
-  truncateFit(connTxt, OLED_WIDTH - 4);
-  int cw = u8g2.getStrWidth(connTxt.c_str());
-  u8g2.setCursor((OLED_WIDTH - cw) / 2, 62);
-  u8g2.print(connTxt);
+
+  // Divider line
+  u8g2.drawHLine(0, 40, OLED_WIDTH);
+
+  // Status - bold, below the line
+  u8g2.setFont(u8g2_font_7x13B_tr);
+  String topStatus = anySensorIssue() ? "Checking..." : "No Problem Found";
+  truncateFit(topStatus, OLED_WIDTH - 4);
+  int tw = u8g2.getStrWidth(topStatus.c_str());
+  u8g2.setCursor((OLED_WIDTH - tw) / 2, 56);
+  u8g2.print(topStatus);
+
   u8g2.sendBuffer();
 }
 
@@ -372,11 +411,11 @@ void triggerOLEDStatus() {
   lastOledUpdate = millis();
 }
 
-void drawHazardStripes(int y, int height) {
-  for (int x = -height; x < OLED_WIDTH; x += 6) {
-    u8g2.drawLine(x, y + height, x + height, y);
-  }
-}
+// void drawHazardStripes(int y, int height) {
+//   for (int x = -height; x < OLED_WIDTH; x += 6) {
+//     u8g2.drawLine(x, y + height, x + height, y);
+//   }
+// }
 
 void drawOLEDAlertFrame(bool inverted) {
   u8g2.clearBuffer();
@@ -389,8 +428,8 @@ void drawOLEDAlertFrame(bool inverted) {
   }
   u8g2.drawFrame(0, 0, OLED_WIDTH, OLED_HEIGHT);
   u8g2.drawFrame(2, 2, OLED_WIDTH - 4, OLED_HEIGHT - 4);
-  drawHazardStripes(0, 4);
-  drawHazardStripes(OLED_HEIGHT - 4, 4);
+  // drawHazardStripes(0, 4);
+  // drawHazardStripes(OLED_HEIGHT - 4, 4);
   // FIX: bumped from 7x13B/6x10 to 8x13B/6x12 -- noticeably bigger and bolder,
   // spacing below is tuned so 2-line titles + wrapped action text still stay
   // clear of the top/bottom hazard stripes on a 128x64 screen.
