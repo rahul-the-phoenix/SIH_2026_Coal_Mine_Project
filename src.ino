@@ -13,10 +13,10 @@ const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 19800;
 
 // Pin Definitions
-#define KNOCK_PIN 12
+#define KNOCK_PIN 32
 #define TILT_PIN 5
 #define LED_PIN 2
-#define BUZZER_PIN 13   // active buzzer module - change if wired to a different pin
+#define BUZZER_PIN 13
 
 // MPU6050 Object
 MPU6050 mpu(Wire);
@@ -24,19 +24,31 @@ const uint8_t MPU_ADDR = 0x68;
 
 BluetoothSerial bt;
 
-// ===== OLED (1.3" - most common driver is SH1106, 128x64, I2C) =====
+// ===== OLED (1.3" SH1106, 128x64, I2C) =====
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
-// U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 
-// ===== WEB SERVER (WiFi Dashboard) =====
+// ===== WEB SERVER =====
 WebServer server(80);
 
 volatile bool knock = false;
 unsigned long lastKnock = 0;
 unsigned long lastNotif = 0;
+
+// ===== SW-180P VIBRATION SENSOR VARIABLES =====
+// SW-180P is a spring-based switch: stable = HIGH, vibration = LOW pulse
+// Mechanical bounce is high, so we use multi-sample verification.
+volatile unsigned int knockPulseCount = 0;
+volatile unsigned long lastKnockPulseTime = 0;
+
+const unsigned long KNOCK_PULSE_WINDOW = 50;    // 50ms between valid pulses
+const unsigned int  KNOCK_MIN_PULSES  = 3;       // need 4+ pulses to confirm
+const unsigned long KNOCK_CHECK_INTERVAL = 500;  // check every 500ms
+const unsigned long KNOCK_ALERT_COOLDOWN = 3000; // 3s between alerts
+
+unsigned long lastKnockCheck = 0;
 
 // ===== TILT VARIABLES (1.5 sec verification) =====
 unsigned long tiltStartTime = 0;
@@ -53,12 +65,16 @@ float axChange = 0, ayChange = 0, azChange = 0;
 unsigned long lastMPURead = 0;
 unsigned long lastMPUNotif = 0;
 bool mpuAlertSent = false;
-unsigned long mpuAlertUntil = 0;   // FIX: latch window so the flag doesn't flicker every 100ms
+unsigned long mpuAlertUntil = 0;
 bool mpuInitialized = false;
 
-const float MPU_THRESHOLD = 1.0;
+const float MPU_THRESHOLD = 0.5;    // increased from 1.0 to reduce false alerts
 const unsigned long MPU_CHECK_INTERVAL = 100;
 const unsigned long MPU_COOLDOWN = 3000;
+
+// ===== MPU LOW-PASS FILTER =====
+float axFiltered = 0, ayFiltered = 0, azFiltered = 0;
+const float MPU_ALPHA = 0.4;
 
 // ===== TIME VARIABLES =====
 bool timeOK = false;
@@ -92,20 +108,19 @@ unsigned long alertActiveUntil = 0;
 const unsigned long ALERT_ACTIVE_DURATION = 8000;
 
 // ===== BUZZER VARIABLES =====
-// Non-blocking beeping pattern (like the OLED alert blink / tilt logic)
-// so the buzzer never freezes loop() the way a delay()-based beep would.
 bool buzzerBeeping = false;
 bool buzzerPinState = false;
 unsigned long buzzerStopAt = 0;
 unsigned long lastBuzzerToggle = 0;
-const unsigned long BUZZER_BEEP_INTERVAL = 80;   // on/off toggle speed
-const unsigned long BUZZER_ALERT_DURATION = 4000; // how long it beeps per alert
+const unsigned long BUZZER_BEEP_INTERVAL = 80;
+const unsigned long BUZZER_ALERT_DURATION = 4000;
 
-// ===== INTERRUPT =====
+// ===== INTERRUPT (SW-180P triggers on FALLING edge) =====
 void IRAM_ATTR isrKnock() {
-  if (millis() - lastKnock > 100) {
-    knock = true;
-    lastKnock = millis();
+  unsigned long now = millis();
+  if (now - lastKnockPulseTime > KNOCK_PULSE_WINDOW) {
+    knockPulseCount++;
+    lastKnockPulseTime = now;
   }
 }
 
@@ -195,9 +210,19 @@ bool initMPU6050() {
 
 void readMPU6050() {
   mpu.update();
-  ax = mpu.getAccX();
-  ay = mpu.getAccY();
-  az = mpu.getAccZ();
+  float rawAx = mpu.getAccX();
+  float rawAy = mpu.getAccY();
+  float rawAz = mpu.getAccZ();
+
+  // Low-pass filter to reduce noise
+  axFiltered = MPU_ALPHA * axFiltered + (1.0 - MPU_ALPHA) * rawAx;
+  ayFiltered = MPU_ALPHA * ayFiltered + (1.0 - MPU_ALPHA) * rawAy;
+  azFiltered = MPU_ALPHA * azFiltered + (1.0 - MPU_ALPHA) * rawAz;
+
+  ax = axFiltered;
+  ay = ayFiltered;
+  az = azFiltered;
+
   gx = mpu.getGyroX();
   gy = mpu.getGyroY();
   gz = mpu.getGyroZ();
@@ -207,10 +232,8 @@ bool detectSuddenMovement() {
   axChange = abs(ax - prevAx);
   ayChange = abs(ay - prevAy);
   azChange = abs(az - prevAz);
-  if (axChange > MPU_THRESHOLD || ayChange > MPU_THRESHOLD || azChange > MPU_THRESHOLD) {
-    return true;
-  }
-  return false;
+  float magnitude = sqrt(axChange*axChange + ayChange*ayChange + azChange*azChange);
+  return magnitude > MPU_THRESHOLD;
 }
 
 String getMPUStatus() {
@@ -233,16 +256,8 @@ String jsonSafe(String s) {
 }
 
 bool anySensorIssue() {
-  return (digitalRead(KNOCK_PIN) == HIGH) || isTilted || mpuAlertSent;
-}
-
-String getConnStatusText() {
-  bool wifiOK = (WiFi.status() == WL_CONNECTED);
-  bool btOK = bt.hasClient();
-  if (wifiOK && btOK)  return "Bluetooth and WiFi OK";
-  if (wifiOK && !btOK) return "WIFI:-OK   BLT:-OK";
-  if (!wifiOK && btOK) return "Bluetooth OK, WiFi --";
-  return "Bluetooth & WiFi --";
+  // SW-180P: stable = HIGH, triggered = LOW
+  return (digitalRead(KNOCK_PIN) == LOW) || isTilted || mpuAlertSent;
 }
 
 // =====================================================================
@@ -294,44 +309,27 @@ int wrapText(String text, int maxWidth, String outLines[], int maxLines) {
 //                              OLED SCREENS
 // =====================================================================
 
-// void initOLED() {
-//   u8g2.begin();
-//   u8g2.enableUTF8Print();
-//   u8g2.clearBuffer();
-//   u8g2.setFont(u8g2_font_helvB10_tr);
-//   u8g2.drawStr(8, 26, "ALERT SYSTEM");
-//   u8g2.setFont(u8g2_font_6x10_tf);
-//   u8g2.drawStr(8, 44, "Starting up...");
-//   u8g2.sendBuffer();
-//   delay(1200);
-// }
-
 void initOLED() {
   u8g2.begin();
   u8g2.enableUTF8Print();
   u8g2.clearBuffer();
 
-  // Border around the whole screen
   u8g2.drawFrame(0, 0, OLED_WIDTH, OLED_HEIGHT);
 
-  // Title - big & bold: "SIH 2026"
   u8g2.setFont(u8g2_font_helvB14_tr);
   String title = "SIH 2026";
   int tw = u8g2.getStrWidth(title.c_str());
   u8g2.setCursor((OLED_WIDTH - tw) / 2, 20);
   u8g2.print(title);
 
-  // Subtitle - a bit smaller, still bold: "Bhumi Rakshha"
   u8g2.setFont(u8g2_font_helvB10_tr);
   String subtitle = "Bhumi Rakshha";
   int sw = u8g2.getStrWidth(subtitle.c_str());
   u8g2.setCursor((OLED_WIDTH - sw) / 2, 36);
   u8g2.print(subtitle);
 
-  // Divider line
   u8g2.drawHLine(8, 42, OLED_WIDTH - 16);
 
-  // Starting up text below the line
   u8g2.setFont(u8g2_font_6x10_tf);
   String startTxt = "Starting up...";
   int stw = u8g2.getStrWidth(startTxt.c_str());
@@ -345,14 +343,12 @@ void initOLED() {
 void oledNormalDisplay() {
   u8g2.clearBuffer();
 
-  // Time - bold monospace font so "HH:MM:SS AM/PM" always fits the width
   u8g2.setFont(u8g2_font_9x15B_tr);
   String t = timeOK ? getTimeOnly() : "--:--:-- --";
   int w = u8g2.getStrWidth(t.c_str());
   u8g2.setCursor((OLED_WIDTH - w) / 2, 20);
   u8g2.print(t);
 
-  // Date - right below the time
   u8g2.setFont(u8g2_font_7x13_tf);
   String dd = timeOK ? (getDayShort() + ", " + getDateOnly()) : "Time Not Synced";
   truncateFit(dd, OLED_WIDTH - 4);
@@ -360,10 +356,8 @@ void oledNormalDisplay() {
   u8g2.setCursor((OLED_WIDTH - w2) / 2, 34);
   u8g2.print(dd);
 
-  // Divider line
   u8g2.drawHLine(0, 40, OLED_WIDTH);
 
-  // Status - bold, below the line
   u8g2.setFont(u8g2_font_7x13B_tr);
   String topStatus = anySensorIssue() ? "Checking..." : "No Problem Found";
   truncateFit(topStatus, OLED_WIDTH - 4);
@@ -389,7 +383,8 @@ void drawOLEDStatusScreen() {
   u8g2.setCursor(4, y); u8g2.print(wifiLine); y += 8;
   String btLine = "Bluetooth: " + String(bt.hasClient() ? "Connected" : "Not Connected");
   u8g2.setCursor(4, y); u8g2.print(btLine); y += 8;
-  String knockLine = "D4 Knock: " + String(digitalRead(KNOCK_PIN) ? "FALL!" : "Normal");
+  // SW-180P: LOW = vibration detected
+  String knockLine = "D12 SW-180P: " + String(digitalRead(KNOCK_PIN) == LOW ? "VIB!" : "Normal");
   u8g2.setCursor(4, y); u8g2.print(knockLine); y += 8;
   String tiltLine;
   if (tiltAlertSent) tiltLine = "D5 Tilt: TILTED!";
@@ -411,12 +406,6 @@ void triggerOLEDStatus() {
   lastOledUpdate = millis();
 }
 
-// void drawHazardStripes(int y, int height) {
-//   for (int x = -height; x < OLED_WIDTH; x += 6) {
-//     u8g2.drawLine(x, y + height, x + height, y);
-//   }
-// }
-
 void drawOLEDAlertFrame(bool inverted) {
   u8g2.clearBuffer();
   if (inverted) {
@@ -428,11 +417,7 @@ void drawOLEDAlertFrame(bool inverted) {
   }
   u8g2.drawFrame(0, 0, OLED_WIDTH, OLED_HEIGHT);
   u8g2.drawFrame(2, 2, OLED_WIDTH - 4, OLED_HEIGHT - 4);
-  // drawHazardStripes(0, 4);
-  // drawHazardStripes(OLED_HEIGHT - 4, 4);
-  // FIX: bumped from 7x13B/6x10 to 8x13B/6x12 -- noticeably bigger and bolder,
-  // spacing below is tuned so 2-line titles + wrapped action text still stay
-  // clear of the top/bottom hazard stripes on a 128x64 screen.
+
   int yPos = 16;
   u8g2.setFont(u8g2_font_8x13B_tr);
   for (int i = 0; i < alertTitleLineCount; i++) {
@@ -487,6 +472,7 @@ void sendAlert(String alertType, String sensorName, String actionLine,
     timeLine = "";
   }
   String actionOut = actionEmoji + " Action: " + actionLine;
+
   Serial.println(titleLine);
   Serial.println(sensorLine);
   Serial.println(dateLine);
@@ -494,6 +480,7 @@ void sendAlert(String alertType, String sensorName, String actionLine,
   Serial.println(actionOut);
   Serial.println("");
   Serial.println("");
+
   bt.println(titleLine);
   bt.println(sensorLine);
   bt.println(dateLine);
@@ -501,8 +488,10 @@ void sendAlert(String alertType, String sensorName, String actionLine,
   bt.println(actionOut);
   bt.println("");
   bt.println("");
+
   triggerOLEDAlert(oledTitle, oledAction);
   if (buzz) startBuzzer();
+
   lastAlertType   = alertType;
   lastAlertSensor = sensorName;
   lastAlertAction = actionLine;
@@ -523,312 +512,80 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
 <title>Alert System Dashboard</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-
   :root{
-    --bg:#070a12;
-    --card:#0f1524;
-    --card2:#0c111d;
-    --line:#1c2740;
-    --line-soft:#161f34;
-    --text:#eaf0fb;
-    --muted:#7c8aa8;
-    --accent:#4fd1c5;
-    --accent2:#8b7bff;
-    --good:#3fe0a5;
-    --bad:#ff5470;
-    --warn:#ffb84f;
+    --bg:#070a12; --card:#0f1524; --card2:#0c111d; --line:#1c2740;
+    --line-soft:#161f34; --text:#eaf0fb; --muted:#7c8aa8;
+    --accent:#4fd1c5; --accent2:#8b7bff; --good:#3fe0a5;
+    --bad:#ff5470; --warn:#ffb84f;
   }
-
   html,body{ height:100%; }
-
   body {
-    background: var(--bg);
-    color: var(--text);
+    background: var(--bg); color: var(--text);
     font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Arial, sans-serif;
-    min-height: 100vh;
-    padding: 22px 16px 50px;
-    position: relative;
-    overflow-x: hidden;
+    min-height: 100vh; padding: 22px 16px 50px;
+    position: relative; overflow-x: hidden;
   }
-
-  /* ===== ambient glow blobs ===== */
-  .bg-glow{
-    position: fixed;
-    inset: 0;
-    z-index: -1;
-    overflow: hidden;
-    pointer-events: none;
-  }
-  .bg-glow span{
-    position: absolute;
-    border-radius: 50%;
-    filter: blur(90px);
-    opacity: .35;
-  }
-  .bg-glow span:nth-child(1){
-    width: 380px; height: 380px;
-    background: var(--accent);
-    top: -120px; left: -100px;
-    animation: floatBlob 12s ease-in-out infinite;
-  }
-  .bg-glow span:nth-child(2){
-    width: 320px; height: 320px;
-    background: var(--accent2);
-    bottom: -100px; right: -80px;
-    animation: floatBlob 14s ease-in-out infinite reverse;
-  }
-  .bg-glow span:nth-child(3){
-    width: 260px; height: 260px;
-    background: #2a5bff;
-    top: 40%; left: 60%;
-    opacity: .15;
-    animation: floatBlob 18s ease-in-out infinite;
-  }
-  @keyframes floatBlob{
-    0%,100% { transform: translate(0,0) scale(1); }
-    50% { transform: translate(30px,-25px) scale(1.08); }
-  }
-
+  .bg-glow{ position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+  .bg-glow span{ position: absolute; border-radius: 50%; filter: blur(90px); opacity: .35; }
+  .bg-glow span:nth-child(1){ width: 380px; height: 380px; background: var(--accent); top: -120px; left: -100px; animation: floatBlob 12s ease-in-out infinite; }
+  .bg-glow span:nth-child(2){ width: 320px; height: 320px; background: var(--accent2); bottom: -100px; right: -80px; animation: floatBlob 14s ease-in-out infinite reverse; }
+  .bg-glow span:nth-child(3){ width: 260px; height: 260px; background: #2a5bff; top: 40%; left: 60%; opacity: .15; animation: floatBlob 18s ease-in-out infinite; }
+  @keyframes floatBlob{ 0%,100% { transform: translate(0,0) scale(1); } 50% { transform: translate(30px,-25px) scale(1.08); } }
   .container { max-width: 1180px; margin: 0 auto; position: relative; }
-
-  /* ===== HEADER ===== */
   .header { text-align: center; padding: 18px 0 6px; }
-  .header .badge{
-    display:inline-flex; align-items:center; gap:6px;
-    font-size:11px; letter-spacing:2px; text-transform:uppercase;
-    color: var(--accent); background: rgba(79,209,197,.08);
-    border:1px solid rgba(79,209,197,.25);
-    padding:4px 12px; border-radius: 999px; margin-bottom:10px;
-  }
-  .header .badge .dot{
-    width:6px; height:6px; border-radius:50%; background: var(--good);
-    box-shadow: 0 0 8px var(--good);
-    animation: blinkDot 1.6s ease-in-out infinite;
-  }
+  .header .badge{ display:inline-flex; align-items:center; gap:6px; font-size:11px; letter-spacing:2px; text-transform:uppercase; color: var(--accent); background: rgba(79,209,197,.08); border:1px solid rgba(79,209,197,.25); padding:4px 12px; border-radius: 999px; margin-bottom:10px; }
+  .header .badge .dot{ width:6px; height:6px; border-radius:50%; background: var(--good); box-shadow: 0 0 8px var(--good); animation: blinkDot 1.6s ease-in-out infinite; }
   @keyframes blinkDot{ 0%,100%{opacity:1;} 50%{opacity:.35;} }
-  .header h1 {
-    font-size: 34px;
-    font-weight: 800;
-    background: linear-gradient(135deg, #4fd1c5 0%, #8b7bff 50%, #4fd1c5 100%);
-    background-size: 200% 200%;
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-    animation: gradientShift 4s ease-in-out infinite;
-    letter-spacing: 1px;
-  }
-  @keyframes gradientShift {
-    0%, 100% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
-  }
-  .header .sub {
-    color: var(--muted);
-    font-size: 13px;
-    margin-top: 6px;
-    letter-spacing: 3px;
-    text-transform: uppercase;
-  }
-
-  /* ===== BUTTONS ===== */
-  .btn-group {
-    display: flex;
-    justify-content: center;
-    gap: 12px;
-    flex-wrap: wrap;
-    margin: 20px 0 24px;
-  }
-  .btn {
-    background: linear-gradient(135deg, #141d34, #0d1424);
-    border: 1px solid var(--line);
-    color: #c2cde3;
-    padding: 11px 24px;
-    border-radius: 14px;
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all .25s ease;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .btn:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 10px 28px rgba(79, 209, 197, 0.18);
-    border-color: var(--accent);
-    color: #fff;
-  }
+  .header h1 { font-size: 34px; font-weight: 800; background: linear-gradient(135deg, #4fd1c5 0%, #8b7bff 50%, #4fd1c5 100%); background-size: 200% 200%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: gradientShift 4s ease-in-out infinite; letter-spacing: 1px; }
+  @keyframes gradientShift { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+  .header .sub { color: var(--muted); font-size: 13px; margin-top: 6px; letter-spacing: 3px; text-transform: uppercase; }
+  .btn-group { display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; margin: 20px 0 24px; }
+  .btn { background: linear-gradient(135deg, #141d34, #0d1424); border: 1px solid var(--line); color: #c2cde3; padding: 11px 24px; border-radius: 14px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all .25s ease; display: flex; align-items: center; gap: 8px; }
+  .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 28px rgba(79, 209, 197, 0.18); border-color: var(--accent); color: #fff; }
   .btn:active { transform: scale(0.96); }
   .btn:disabled{ opacity:.7; cursor:default; transform:none; }
-  .btn-primary {
-    background: linear-gradient(135deg, var(--accent), var(--accent2));
-    border-color: transparent;
-    color: #06111a;
-  }
+  .btn-primary { background: linear-gradient(135deg, var(--accent), var(--accent2)); border-color: transparent; color: #06111a; }
   .btn-primary:hover { box-shadow: 0 10px 34px rgba(139, 123, 255, 0.35); color:#06111a; }
   .btn .icon { font-size: 18px; }
-
-  /* ===== STATUS BANNER ===== */
-  .status-banner {
-    background: linear-gradient(160deg, var(--card), var(--card2));
-    border-radius: 20px;
-    padding: 22px 26px;
-    margin-bottom: 22px;
-    border: 1px solid var(--line);
-    display: flex;
-    align-items: center;
-    gap: 20px;
-    flex-wrap: wrap;
-    transition: all 0.5s ease;
-    position: relative;
-    overflow: hidden;
-  }
-  .status-banner::before{
-    content:"";
-    position:absolute; inset:0;
-    background: radial-gradient(600px circle at 0% 0%, rgba(79,209,197,.08), transparent 60%);
-    pointer-events:none;
-  }
-  .icon-ring{
-    width: 62px; height:62px; border-radius:50%;
-    display:flex; align-items:center; justify-content:center;
-    font-size: 28px;
-    background: rgba(79,209,197,.1);
-    border: 2px solid rgba(79,209,197,.35);
-    flex-shrink:0;
-  }
+  .status-banner { background: linear-gradient(160deg, var(--card), var(--card2)); border-radius: 20px; padding: 22px 26px; margin-bottom: 22px; border: 1px solid var(--line); display: flex; align-items: center; gap: 20px; flex-wrap: wrap; transition: all 0.5s ease; position: relative; overflow: hidden; }
+  .status-banner::before{ content:""; position:absolute; inset:0; background: radial-gradient(600px circle at 0% 0%, rgba(79,209,197,.08), transparent 60%); pointer-events:none; }
+  .icon-ring{ width: 62px; height:62px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size: 28px; background: rgba(79,209,197,.1); border: 2px solid rgba(79,209,197,.35); flex-shrink:0; }
   .status-banner .content { flex: 1; min-width: 220px; z-index:1; }
-  .status-banner .label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 2px;
-    opacity: 0.65;
-    font-weight:700;
-  }
-  .status-banner .title {
-    font-size: 23px;
-    font-weight: 800;
-    margin: 5px 0 6px;
-  }
+  .status-banner .label { font-size: 11px; text-transform: uppercase; letter-spacing: 2px; opacity: 0.65; font-weight:700; }
+  .status-banner .title { font-size: 23px; font-weight: 800; margin: 5px 0 6px; }
   .status-banner .action { font-size: 15px; opacity: 0.9; }
   .status-banner .meta { font-size: 12px; opacity: 0.5; margin-top: 8px; }
-
   .status-banner.normal { border-color: rgba(63,224,165,.28); }
   .status-banner.normal .icon-ring{ background: rgba(63,224,165,.1); border-color: rgba(63,224,165,.4); }
   .status-banner.normal .title { color: var(--good); }
-
-  .status-banner.active {
-    border-color: rgba(255,84,112,.6);
-    background: linear-gradient(160deg, #1c0f18, #150a10);
-    animation: pulseGlow 1.2s ease-in-out infinite;
-  }
+  .status-banner.active { border-color: rgba(255,84,112,.6); background: linear-gradient(160deg, #1c0f18, #150a10); animation: pulseGlow 1.2s ease-in-out infinite; }
   .status-banner.active .icon-ring{ background: rgba(255,84,112,.12); border-color: rgba(255,84,112,.55); }
   .status-banner.active .title { color: var(--bad); }
-  @keyframes pulseGlow {
-    0%, 100% {
-      box-shadow:
-        0 0 20px rgba(255, 84, 112, 0.35),
-        0 0 55px rgba(255, 84, 112, 0.18);
-    }
-    50% {
-      box-shadow:
-        0 0 40px rgba(255, 84, 112, 0.65),
-        0 0 100px rgba(255, 84, 112, 0.35);
-    }
-  }
-
-  /* ===== STATUS GRID ===== */
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
-    gap: 14px;
-    margin-bottom: 20px;
-  }
-  .stat-card {
-    background: var(--card);
-    border-radius: 16px;
-    padding: 18px 16px;
-    text-align: center;
-    border: 1px solid var(--line-soft);
-    transition: all 0.25s ease;
-    position: relative;
-  }
-  .stat-card:hover {
-    border-color: rgba(79,209,197,.4);
-    transform: translateY(-3px);
-    box-shadow: 0 10px 28px rgba(0,0,0,0.35);
-  }
+  @keyframes pulseGlow { 0%, 100% { box-shadow: 0 0 20px rgba(255, 84, 112, 0.35), 0 0 55px rgba(255, 84, 112, 0.18); } 50% { box-shadow: 0 0 40px rgba(255, 84, 112, 0.65), 0 0 100px rgba(255, 84, 112, 0.35); } }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 14px; margin-bottom: 20px; }
+  .stat-card { background: var(--card); border-radius: 16px; padding: 18px 16px; text-align: center; border: 1px solid var(--line-soft); transition: all 0.25s ease; position: relative; }
+  .stat-card:hover { border-color: rgba(79,209,197,.4); transform: translateY(-3px); box-shadow: 0 10px 28px rgba(0,0,0,0.35); }
   .stat-card .stat-icon{ font-size:20px; margin-bottom:6px; }
-  .stat-card .stat-label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    color: var(--muted);
-    font-weight:600;
-  }
-  .stat-card .stat-value {
-    font-size: 21px;
-    font-weight: 800;
-    margin-top: 8px;
-    transition: color 0.3s;
-  }
+  .stat-card .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--muted); font-weight:600; }
+  .stat-card .stat-value { font-size: 21px; font-weight: 800; margin-top: 8px; transition: color 0.3s; }
   .stat-card .stat-value.ok { color: var(--good); }
   .stat-card .stat-value.warn { color: var(--bad); }
   .stat-card .stat-value.neutral { color: var(--text); }
   .stat-card .stat-sub { font-size: 12px; color: #56628060; margin-top: 4px; color:#5b6a89; }
-  .pulse-badge{
-    position:absolute; top:12px; right:12px;
-    width:8px; height:8px; border-radius:50%;
-    background: var(--good);
-  }
+  .pulse-badge{ position:absolute; top:12px; right:12px; width:8px; height:8px; border-radius:50%; background: var(--good); }
   .pulse-badge.warn{ background: var(--bad); box-shadow:0 0 10px var(--bad); animation: pulseGlow 1s ease-in-out infinite; }
-
-  /* ===== TIME CARD ===== */
-  .time-card {
-    grid-column: 1 / -1;
-    background: linear-gradient(135deg, var(--card), var(--card2));
-    border: 1px solid var(--line-soft);
-    display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px;
-    text-align:left;
-    padding: 20px 26px;
-  }
-  .time-card .stat-value {
-    font-size: clamp(24px, 6vw, 40px);
-    font-weight: 200;
-    letter-spacing: clamp(1px, 0.5vw, 3px);
-    color: var(--accent);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
+  .time-card { grid-column: 1 / -1; background: linear-gradient(135deg, var(--card), var(--card2)); border: 1px solid var(--line-soft); display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px; text-align:left; padding: 20px 26px; }
+  .time-card .stat-value { font-size: clamp(24px, 6vw, 40px); font-weight: 200; letter-spacing: clamp(1px, 0.5vw, 3px); color: var(--accent); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .time-card .stat-sub { font-size: 14px; color: var(--muted); margin-top:4px; }
   .time-card .conn-pills{ display:flex; gap:8px; flex-wrap:wrap; }
-  .pill{
-    font-size:12px; font-weight:700; padding:6px 12px; border-radius:999px;
-    border:1px solid var(--line); display:flex; align-items:center; gap:6px;
-  }
+  .pill{ font-size:12px; font-weight:700; padding:6px 12px; border-radius:999px; border:1px solid var(--line); display:flex; align-items:center; gap:6px; }
   .pill .d{ width:7px; height:7px; border-radius:50%; }
   .pill.ok .d{ background:var(--good); box-shadow:0 0 6px var(--good); }
   .pill.bad .d{ background:var(--bad); box-shadow:0 0 6px var(--bad); }
-
-  /* ===== MPU DATA ===== */
-  .mpu-panel{
-    background: var(--card);
-    border-radius: 18px;
-    padding: 20px 22px;
-    border: 1px solid var(--line-soft);
-  }
-  .mpu-panel .panel-title{
-    text-align:center; font-size: 12px; color: var(--muted);
-    text-transform: uppercase; letter-spacing: 2px; margin-bottom: 14px;
-    font-weight:700;
-  }
+  .mpu-panel{ background: var(--card); border-radius: 18px; padding: 20px 22px; border: 1px solid var(--line-soft); }
+  .mpu-panel .panel-title{ text-align:center; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 2px; margin-bottom: 14px; font-weight:700; }
   .mpu-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  .mpu-item {
-    background: var(--card2);
-    border-radius: 12px;
-    padding: 12px 8px;
-    border: 1px solid var(--line-soft);
-    text-align:center;
-  }
+  .mpu-item { background: var(--card2); border-radius: 12px; padding: 12px 8px; border: 1px solid var(--line-soft); text-align:center; }
   .mpu-item .axis { font-size: 11px; color: var(--muted); font-weight:700; letter-spacing:1px; }
   .mpu-item .val { font-size: 18px; font-weight: 700; margin: 6px 0 8px; }
   .bar-track{ height:6px; background:#0a0f1a; border-radius:4px; overflow:hidden; }
@@ -836,19 +593,7 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
   .bar-fill.x{ background: linear-gradient(90deg,var(--accent),var(--accent2)); }
   .bar-fill.y{ background: linear-gradient(90deg,var(--accent2),#ff7bd0); }
   .bar-fill.z{ background: linear-gradient(90deg,#ffb84f,var(--bad)); }
-
-  /* ===== FOOTER ===== */
-  .footer {
-    text-align: center;
-    color: #3a4a62;
-    font-size: 12px;
-    margin-top: 26px;
-    padding-top: 18px;
-    border-top: 1px solid var(--line-soft);
-    letter-spacing: 1px;
-  }
-
-  /* ===== RESPONSIVE ===== */
+  .footer { text-align: center; color: #3a4a62; font-size: 12px; margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line-soft); letter-spacing: 1px; }
   @media (max-width: 600px) {
     .header h1 { font-size: 24px; }
     .status-banner { padding: 18px; }
@@ -859,7 +604,6 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
     .btn { padding: 9px 18px; font-size: 12px; }
     .mpu-grid { grid-template-columns: 1fr; }
   }
-
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: var(--bg); }
   ::-webkit-scrollbar-thumb { background: #24304a; border-radius: 10px; }
@@ -872,7 +616,7 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
   <div class="header">
     <div class="badge"><span class="dot"></span> LIVE MONITORING</div>
     <h1>⚠️ Alert Detection System</h1>
-    <div class="sub">Knock &middot; Tilt &middot; MPU6050</div>
+    <div class="sub">Vibration &middot; Tilt &middot; MPU6050</div>
   </div>
 
   <div class="btn-group">
@@ -909,8 +653,8 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
 
     <div class="stat-card">
       <div class="pulse-badge" id="knockDot"></div>
-      <div class="stat-icon">👊</div>
-      <div class="stat-label">Knock (D4)</div>
+      <div class="stat-icon">📳</div>
+      <div class="stat-label">Vibration (D12)</div>
       <div class="stat-value" id="knockStatus">--</div>
     </div>
     <div class="stat-card">
@@ -954,7 +698,7 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
   </div>
 
   <div class="footer">
-    ESP32 Alert System &middot; Knock + Tilt + MPU6050 &middot; v2.1
+    ESP32 Alert System &middot; Vibration + Tilt + MPU6050 &middot; v2.2
   </div>
 </div>
 
@@ -984,20 +728,13 @@ function refreshNow() {
 }
 
 function accelBarPct(g) {
-  // map -2g..2g range onto 0-100% width for the little bar indicators
   const clamped = Math.max(-2, Math.min(2, g));
   return Math.round(((clamped + 2) / 4) * 100);
 }
 
-// ===== SMOOTH CLIENT-SIDE CLOCK =====
-// The board only sends a fresh time string every ~2s over /data. Just
-// printing that string caused the displayed clock to jump/stutter instead
-// of ticking every second. Instead we parse it into a real Date once per
-// fetch, then advance it locally every second and resync on the next fetch.
 let clockDate = null;
 
 function parseServerDateTime(timeStr, dateStr) {
-  // timeStr: "09:15:32 PM"   dateStr: "10/09/2026" (DD/MM/YYYY)
   if (!timeStr || timeStr === 'N/A' || !dateStr || dateStr === 'N/A') return null;
   const m = timeStr.match(/(\d{1,2}):(\d{2}):(\d{2})\s*([AP]M)/i);
   const dp = dateStr.split('/');
@@ -1085,7 +822,6 @@ async function refresh() {
     const banner = document.getElementById('statusBanner');
 
     if (d.alertActive) {
-      // Real alert currently active -- show its details
       document.getElementById('bannerTitle').textContent = d.alertTitle;
       document.getElementById('bannerAction').textContent = d.alertAction;
       document.getElementById('bannerMeta').textContent = 'Sensor: ' + d.alertSensor + ' · Time: ' + d.alertTime;
@@ -1093,8 +829,6 @@ async function refresh() {
       document.getElementById('bannerKicker').textContent = '🚨 ALERT ACTIVE';
       document.getElementById('bannerIcon').textContent = '⚠️';
     } else {
-      // Nothing active right now -- make that explicit instead of leaving
-      // the last alert's text lingering on screen
       document.getElementById('bannerTitle').textContent = 'No Alert Detected';
       document.getElementById('bannerAction').textContent = 'All sensors normal — system monitoring';
       document.getElementById('bannerMeta').textContent =
@@ -1129,13 +863,16 @@ void handleData() {
 
   bool alertActive = millis() < alertActiveUntil;
 
+  // SW-180P: LOW = vibration detected
+  bool knockNow = (digitalRead(KNOCK_PIN) == LOW);
+
   String json = "{";
   json += "\"time\":\"" + (timeOK ? getTimeOnly() : String("N/A")) + "\",";
   json += "\"date\":\"" + (timeOK ? getDateOnly() : String("N/A")) + "\",";
   json += "\"day\":\"" + (timeOK ? getDayOnly() : String("N/A")) + "\",";
   json += "\"wifi\":\"" + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected") + "\",";
   json += "\"ip\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("N/A")) + "\",";
-  json += "\"knock\":\"" + String(digitalRead(KNOCK_PIN) ? "FALL DETECTED" : "Normal") + "\",";
+  json += "\"knock\":\"" + String(knockNow ? "VIBRATION" : "Normal") + "\",";
   json += "\"tilt\":\"" + tiltStatus + "\",";
   json += "\"mpu\":\"" + String(mpuAlertSent ? "ALERT" : "Normal") + "\",";
   json += "\"ax\":" + String(ax, 2) + ",";
@@ -1169,7 +906,7 @@ void setup() {
   Serial.begin(115200);
   Serial.println("========================================");
   Serial.println("   COMPLETE ALERT DETECTION SYSTEM");
-  Serial.println("   KNOCK + TILT + MPU6050 + OLED + WEB");
+  Serial.println("   VIBRATION + TILT + MPU6050 + OLED + WEB");
   Serial.println("========================================\n");
 
   initOLED();
@@ -1207,27 +944,39 @@ void setup() {
     Serial.println("\nWiFi Failed! Time and dashboard unavailable.");
   }
 
+  // ===== SW-180P Pin Setup (BEFORE MPU init so pullup is stable) =====
+  pinMode(KNOCK_PIN, INPUT_PULLUP);   // SW-180P: stable = HIGH
+  pinMode(TILT_PIN, INPUT_PULLUP);    // Tilt reversed logic (LOW = tilted)
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // SW-180P triggers on FALLING edge
+  attachInterrupt(digitalPinToInterrupt(KNOCK_PIN), isrKnock, FALLING);
+
   Serial.println("\nInitializing MPU6050...");
   mpuInitialized = initMPU6050();
   if (mpuInitialized) {
-    readMPU6050();
+    delay(2000);   // let module settle after calibration
+    for (int i = 0; i < 10; i++) {
+      readMPU6050();
+      delay(50);
+    }
     prevAx = ax;
     prevAy = ay;
     prevAz = az;
   }
 
   bt.begin("Alert_System");
-  // FIX: default BluetoothSerial readString() timeout is ~1000ms and blocks
-  // the whole loop() (sensors, OLED animation, web server) while waiting.
-  // Cutting it down keeps loop() responsive when a BT command is typed.
   bt.setTimeout(50);
   Serial.println("Bluetooth Started: Alert_System");
 
   bt.println("========================================");
   bt.println("   COMPLETE ALERT DETECTION SYSTEM");
   bt.println("========================================");
-  bt.println("D4: Heavy Weight Fall (Knock)");
-  bt.println("D5: Land Tilt (1.5 sec delay) - REVERSED LOGIC (LOW=Tilt)");
+  bt.println("D12: SW-180P Vibration Sensor");
+  bt.println("D5:  Land Tilt (1.5 sec delay) - REVERSED (LOW=Tilt)");
   if (mpuInitialized) {
     bt.println("MPU6050: Sudden Movement");
     bt.println("   Threshold: " + String(MPU_THRESHOLD) + "g");
@@ -1242,17 +991,9 @@ void setup() {
   bt.println("Type 'help' for commands");
   bt.println("========================================");
 
-  pinMode(KNOCK_PIN, INPUT);
-  pinMode(TILT_PIN, INPUT);
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-  digitalWrite(BUZZER_PIN, LOW);
-  attachInterrupt(KNOCK_PIN, isrKnock, RISING);
-
   Serial.println("\nSystem Ready!");
-  Serial.println("D4: Heavy Weight Fall Detection");
-  Serial.println("D5: Land Tilt Detection (1.5 sec delay) - REVERSED (LOW=Tilt)");
+  Serial.println("D12: SW-180P Vibration Detection");
+  Serial.println("D5:  Land Tilt Detection (1.5 sec delay) - REVERSED (LOW=Tilt)");
   if (mpuInitialized) {
     Serial.println("MPU6050: Sudden Movement Detection");
   }
@@ -1267,25 +1008,35 @@ void setup() {
 }
 
 void loop() {
-  // ===== 1. CHECK KNOCK SENSOR (D4) =====
-  if (knock) {
-    digitalWrite(LED_PIN, HIGH);
-    knock = false;
-    if (millis() - lastNotif > 3000) {
-      sendAlert(
-        "HEAVY WEIGHT FALL DETECTED!",
-        "KY-031 Knock Module (D4)",
-        "Immediate inspection required",
-        "FALL DETECTED",
-        "Inspect area now!",
-        "⚠️",
-        "⚡"
-      );
-      lastNotif = millis();
+  // ===== 1. SW-180P VIBRATION SENSOR (D12) =====
+  // Multi-sample verification: real vibration produces multiple pulses
+  // within a short window; light taps produce only 1-2 pulses.
+  if (millis() - lastKnockCheck >= KNOCK_CHECK_INTERVAL) {
+    noInterrupts();
+    unsigned int pulses = knockPulseCount;
+    knockPulseCount = 0;
+    interrupts();
+
+    if (pulses >= KNOCK_MIN_PULSES) {
+      digitalWrite(LED_PIN, HIGH);
+      if (millis() - lastNotif > KNOCK_ALERT_COOLDOWN) {
+        sendAlert(
+          "HEAVY VIBRATION DETECTED!",
+          "SW-180P Vibration Sensor (D12)",
+          "Immediate inspection required",
+          "VIBRATION!",
+          "Inspect area now!",
+          "⚠️",
+          "⚡"
+        );
+        lastNotif = millis();
+        lastKnock = millis();
+      }
     }
+    lastKnockCheck = millis();
   }
 
-  // ===== 2. CHECK TILT SENSOR (D5) - REVERSED LOGIC =====
+  // ===== 2. TILT SENSOR (D5) - REVERSED LOGIC =====
   int currentTiltState = digitalRead(TILT_PIN);
   if (currentTiltState == LOW) {
     if (tiltStartTime == 0) {
@@ -1320,7 +1071,7 @@ void loop() {
           "No action needed",
           "✅",
           "✅",
-          false   // good news - no buzzer
+          false
         );
         lastTiltNotif = millis();
       }
@@ -1330,12 +1081,7 @@ void loop() {
     tiltStartTime = 0;
   }
 
-  // ===== 3. CHECK MPU6050 =====
-  // FIX: mpuAlertSent used to be true only inside the exact 100ms window
-  // detectSuddenMovement() returned true, then snap back to false right
-  // after -- causing the LED / dashboard / OLED "ALERT" state to flicker.
-  // Now it latches for MPU_COOLDOWN after the last detected movement,
-  // matching how the tilt sensor already behaves.
+  // ===== 3. MPU6050 =====
   if (mpuInitialized && (millis() - lastMPURead >= MPU_CHECK_INTERVAL)) {
     readMPU6050();
     if (detectSuddenMovement()) {
@@ -1361,7 +1107,7 @@ void loop() {
     lastMPURead = millis();
   }
 
-  // ===== BUZZER UPDATE (non-blocking beep pattern) =====
+  // ===== BUZZER UPDATE =====
   updateBuzzer();
 
   // ===== LED OFF AFTER TIMEOUT =====
@@ -1404,7 +1150,7 @@ void loop() {
       bt.println("Status: RUNNING");
       bt.println("Device: ESP32");
       bt.println("========================================");
-      bt.println("D4 (Knock): " + String(digitalRead(KNOCK_PIN) ? "FALL DETECTED" : "Normal"));
+      bt.println("D12 (Vibration): " + String(digitalRead(KNOCK_PIN) == LOW ? "VIBRATION" : "Normal"));
       if (tiltAlertSent) {
         bt.println("D5 (Tilt): TILTED (Verified) - REVERSED LOGIC");
       } else if (isTilted) {
@@ -1481,8 +1227,8 @@ void loop() {
         bt.println("Time Not Synced!");
       }
     }
-    else if (c == "d4" || c == "D4") {
-      bt.println("D4 (Knock): " + String(digitalRead(KNOCK_PIN) ? "FALL DETECTED" : "Normal"));
+    else if (c == "d4" || c == "D4" || c == "d12" || c == "D12") {
+      bt.println("D12 (SW-180P): " + String(digitalRead(KNOCK_PIN) == LOW ? "VIBRATION" : "Normal"));
     }
     else if (c == "d5" || c == "D5") {
       if (tiltAlertSent) {
@@ -1520,6 +1266,8 @@ void loop() {
     else if (c == "reset" || c == "RESET") {
       lastKnock = 0;
       knock = false;
+      knockPulseCount = 0;
+      lastKnockPulseTime = 0;
       tiltStartTime = 0;
       isTilted = false;
       tiltAlertSent = false;
@@ -1538,7 +1286,7 @@ void loop() {
       bt.println("  status     - System status (+ shows on OLED)");
       bt.println("  mpu        - MPU6050 data");
       bt.println("  time       - Show Indian time (IST)");
-      bt.println("  d4         - Check Knock sensor (D4)");
+      bt.println("  d4 / d12   - Check SW-180P vibration sensor");
       bt.println("  d5         - Check Tilt sensor (D5)");
       bt.println("  threshold  - Show MPU threshold");
       bt.println("  wifi       - Show WiFi + dashboard link (+ OLED)");
@@ -1549,6 +1297,7 @@ void loop() {
       bt.println("========================================");
       bt.println("TILT DELAY: 1.5 seconds");
       bt.println("Tilt Logic: REVERSED (LOW = Tilted)");
+      bt.println("Vibration: SW-180P on D12");
       bt.println("MPU THRESHOLD: " + String(MPU_THRESHOLD) + "g");
       bt.println("========================================");
     }
