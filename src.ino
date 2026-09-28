@@ -5,6 +5,8 @@
 #include <Wire.h>
 #include <MPU6050_tockn.h>
 #include <U8g2lib.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 const char* ssid = "Me";   //my wifi name 
 const char* password = "password";   //my wifi password
@@ -960,6 +962,55 @@ void setupWebServer() {
   Serial.println("Web dashboard started!");
 }
 
+// =====================================================================
+//                CLOUD LOGGING (Google Sheets via Apps Script)
+// =====================================================================
+// Every CLOUD_INTERVAL ms, MPU6050 + soil data is sent to a Google Apps
+// Script web app, which appends one row to your Google Sheet.
+// Runs in its own FreeRTOS task so the slow HTTPS call never blocks
+// sensor checks, buzzer, OLED or the web server.
+
+// Paste the Web app URL from Apps Script "Deploy" (ends with /exec)
+const char* SHEETS_URL = "https://script.google.com/macros/s/AKfycbzZeBJTW2lDqwjtx7lgsher8rKTVdbQafZZgJumzxcv4SRIvbsyUL6sHGvUCs8j1iRL/exec";
+const char* SHEETS_KEY = "rahul2026";
+const unsigned long CLOUD_INTERVAL = 10000;   // 10 seconds
+
+void cloudTask(void* pv) {
+  for (;;) {
+    vTaskDelay(CLOUD_INTERVAL / portTICK_PERIOD_MS);
+
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+      continue;
+    }
+
+    char query[180];
+    if (mpuInitialized) {
+      snprintf(query, sizeof(query),
+        "?key=%s&ax=%.2f&ay=%.2f&az=%.2f&soil=%d&soilRaw=%d",
+        SHEETS_KEY, ax, ay, az, soilPct, soilRaw);
+    } else {
+      snprintf(query, sizeof(query),
+        "?key=%s&soil=%d&soilRaw=%d",
+        SHEETS_KEY, soilPct, soilRaw);
+    }
+    String url = String(SHEETS_URL) + query;
+
+    WiFiClientSecure client;
+    client.setInsecure();              // skips certificate check (fine for a prototype)
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // Apps Script answers with a 302
+    http.setTimeout(10000);
+    if (http.begin(client, url)) {
+      int code = http.GET();
+      Serial.printf("[Cloud] Sheets -> %d | free heap: %u\n", code, ESP.getFreeHeap());
+      http.end();
+    } else {
+      Serial.println("[Cloud] http.begin failed");
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("========================================");
@@ -1029,6 +1080,9 @@ void setup() {
 
   // Initial soil reading so dashboard/OLED show a value right away
   soilPct = readSoilPercent();
+
+  // Start cloud logging task (core 0; Arduino loop() runs on core 1)
+  xTaskCreatePinnedToCore(cloudTask, "cloud", 12288, NULL, 1, NULL, 0);
 
   bt.begin("Alert_System");
   bt.setTimeout(50);
