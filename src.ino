@@ -17,6 +17,7 @@ const long gmtOffset_sec = 19800;
 #define TILT_PIN 5
 #define LED_PIN 2
 #define BUZZER_PIN 13
+#define SOIL_PIN 34          // Soil moisture AO (input-only ADC1 pin, safe with WiFi)
 
 // MPU6050 Object
 MPU6050 mpu(Wire);
@@ -44,7 +45,7 @@ volatile unsigned int knockPulseCount = 0;
 volatile unsigned long lastKnockPulseTime = 0;
 
 const unsigned long KNOCK_PULSE_WINDOW = 50;    // 50ms between valid pulses
-const unsigned int  KNOCK_MIN_PULSES  = 3;       // need 4+ pulses to confirm
+const unsigned int  KNOCK_MIN_PULSES  = 3;       // need 3+ pulses to confirm
 const unsigned long KNOCK_CHECK_INTERVAL = 500;  // check every 500ms
 const unsigned long KNOCK_ALERT_COOLDOWN = 3000; // 3s between alerts
 
@@ -75,6 +76,23 @@ const unsigned long MPU_COOLDOWN = 3000;
 // ===== MPU LOW-PASS FILTER =====
 float axFiltered = 0, ayFiltered = 0, azFiltered = 0;
 const float MPU_ALPHA = 0.4;
+
+// ===== SOIL MOISTURE VARIABLES =====
+// CALIBRATE: dry air = high raw value, glass of water = low raw value.
+// Print soilRaw to Serial once and set these two to your probe's readings.
+const int SOIL_DRY_RAW = 3200;
+const int SOIL_WET_RAW = 1300;
+const int SOIL_THRESHOLD_PCT = 70;                 // alert when moisture >= this %
+const unsigned long SOIL_CHECK_INTERVAL = 1000;    // read every 1s
+const unsigned long SOIL_VERIFY_TIME = 5000;       // must stay high for 5s
+const unsigned long SOIL_ALERT_COOLDOWN = 30000;   // 30s between alerts
+
+int soilRaw = 0;
+int soilPct = 0;
+unsigned long lastSoilRead = 0;
+unsigned long soilHighStart = 0;
+unsigned long lastSoilNotif = 0;
+bool soilAlertSent = false;
 
 // ===== TIME VARIABLES =====
 bool timeOK = false;
@@ -247,6 +265,19 @@ String getMPUChange() {
   return change;
 }
 
+// ===== SOIL MOISTURE FUNCTION =====
+// Averages 10 samples, converts raw ADC to 0-100 % (0 = dry, 100 = wet)
+int readSoilPercent() {
+  long sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogRead(SOIL_PIN);
+    delay(2);
+  }
+  soilRaw = sum / 10;
+  int pct = map(soilRaw, SOIL_DRY_RAW, SOIL_WET_RAW, 0, 100);
+  return constrain(pct, 0, 100);
+}
+
 String jsonSafe(String s) {
   s.replace("\\", "/");
   s.replace("\"", "'");
@@ -257,7 +288,7 @@ String jsonSafe(String s) {
 
 bool anySensorIssue() {
   // SW-180P: stable = HIGH, triggered = LOW
-  return (digitalRead(KNOCK_PIN) == LOW) || isTilted || mpuAlertSent;
+  return (digitalRead(KNOCK_PIN) == LOW) || isTilted || mpuAlertSent || soilAlertSent;
 }
 
 // =====================================================================
@@ -384,17 +415,17 @@ void drawOLEDStatusScreen() {
   String btLine = "Bluetooth: " + String(bt.hasClient() ? "Connected" : "Not Connected");
   u8g2.setCursor(4, y); u8g2.print(btLine); y += 8;
   // SW-180P: LOW = vibration detected
-  String knockLine = "D12 SW-180P: " + String(digitalRead(KNOCK_PIN) == LOW ? "VIB!" : "Normal");
+  String knockLine = "SW-180P: " + String(digitalRead(KNOCK_PIN) == LOW ? "VIB!" : "Normal");
   u8g2.setCursor(4, y); u8g2.print(knockLine); y += 8;
   String tiltLine;
-  if (tiltAlertSent) tiltLine = "D5 Tilt: TILTED!";
-  else if (isTilted) tiltLine = "D5 Tilt: Checking...";
-  else tiltLine = "D5 Tilt: LEVEL";
+  if (tiltAlertSent) tiltLine = "Tilt: TILTED!";
+  else if (isTilted) tiltLine = "Tilt: Checking...";
+  else tiltLine = "Tilt: LEVEL";
   u8g2.setCursor(4, y); u8g2.print(tiltLine); y += 8;
   String mpuLine = mpuInitialized ? ("MPU6050: " + String(mpuAlertSent ? "ALERT!" : "Normal")) : "MPU6050: Not Found";
   u8g2.setCursor(4, y); u8g2.print(mpuLine); y += 8;
-  String ledLine = "LED: " + String(digitalRead(LED_PIN) ? "ON" : "OFF");
-  u8g2.setCursor(4, y); u8g2.print(ledLine); y += 8;
+  String soilLine = "Soil: " + String(soilPct) + "% " + String(soilAlertSent ? "HIGH!" : "OK");
+  u8g2.setCursor(4, y); u8g2.print(soilLine); y += 8;
   u8g2.sendBuffer();
 }
 
@@ -571,7 +602,7 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
   .stat-card .stat-value.ok { color: var(--good); }
   .stat-card .stat-value.warn { color: var(--bad); }
   .stat-card .stat-value.neutral { color: var(--text); }
-  .stat-card .stat-sub { font-size: 12px; color: #56628060; margin-top: 4px; color:#5b6a89; }
+  .stat-card .stat-sub { font-size: 12px; margin-top: 4px; color:#5b6a89; }
   .pulse-badge{ position:absolute; top:12px; right:12px; width:8px; height:8px; border-radius:50%; background: var(--good); }
   .pulse-badge.warn{ background: var(--bad); box-shadow:0 0 10px var(--bad); animation: pulseGlow 1s ease-in-out infinite; }
   .time-card { grid-column: 1 / -1; background: linear-gradient(135deg, var(--card), var(--card2)); border: 1px solid var(--line-soft); display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px; text-align:left; padding: 20px 26px; }
@@ -593,6 +624,7 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
   .bar-fill.x{ background: linear-gradient(90deg,var(--accent),var(--accent2)); }
   .bar-fill.y{ background: linear-gradient(90deg,var(--accent2),#ff7bd0); }
   .bar-fill.z{ background: linear-gradient(90deg,#ffb84f,var(--bad)); }
+  .bar-fill.soil{ background: linear-gradient(90deg,#4fd1c5,#2a5bff); }
   .footer { text-align: center; color: #3a4a62; font-size: 12px; margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line-soft); letter-spacing: 1px; }
   @media (max-width: 600px) {
     .header h1 { font-size: 24px; }
@@ -616,7 +648,7 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
   <div class="header">
     <div class="badge"><span class="dot"></span> LIVE MONITORING</div>
     <h1>⚠️ Alert Detection System</h1>
-    <div class="sub">Vibration &middot; Tilt &middot; MPU6050</div>
+    <div class="sub">Vibration &middot; Tilt &middot; MPU6050 &middot; Soil</div>
   </div>
 
   <div class="btn-group">
@@ -654,13 +686,13 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
     <div class="stat-card">
       <div class="pulse-badge" id="knockDot"></div>
       <div class="stat-icon">📳</div>
-      <div class="stat-label">Vibration (D12)</div>
+      <div class="stat-label">Vibration</div>
       <div class="stat-value" id="knockStatus">--</div>
     </div>
     <div class="stat-card">
       <div class="pulse-badge" id="tiltDot"></div>
       <div class="stat-icon">📐</div>
-      <div class="stat-label">Tilt (D5)</div>
+      <div class="stat-label">Tilt</div>
       <div class="stat-value" id="tiltStatus">--</div>
     </div>
     <div class="stat-card">
@@ -668,6 +700,13 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
       <div class="stat-icon">🎯</div>
       <div class="stat-label">MPU6050</div>
       <div class="stat-value" id="mpuStatus">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="pulse-badge" id="soilDot"></div>
+      <div class="stat-icon">💧</div>
+      <div class="stat-label">Soil Moisture</div>
+      <div class="stat-value" id="soilStatus">--</div>
+      <div class="stat-sub" id="soilPct">--</div>
     </div>
     <div class="stat-card">
       <div class="stat-icon">💡</div>
@@ -697,8 +736,16 @@ const char dashboardHTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
+  <div class="mpu-panel" style="margin-top:16px">
+    <div class="panel-title">Soil Moisture Level</div>
+    <div class="mpu-item">
+      <div class="val neutral" id="soilVal">--</div>
+      <div class="bar-track"><div class="bar-fill soil" id="soilBar" style="width:0%"></div></div>
+    </div>
+  </div>
+
   <div class="footer">
-    ESP32 Alert System &middot; Vibration + Tilt + MPU6050 &middot; v2.2
+    ESP32 Alert System &middot; Vibration + Tilt + MPU6050 + Soil &middot; v2.3
   </div>
 </div>
 
@@ -807,6 +854,15 @@ async function refresh() {
     mpuEl.className = 'stat-value ' + (mpuOK ? 'ok' : 'warn');
     document.getElementById('mpuDot').className = 'pulse-badge' + (mpuOK ? '' : ' warn');
 
+    const soilOK = d.soilStatus === 'Normal';
+    const soilEl = document.getElementById('soilStatus');
+    soilEl.textContent = d.soilStatus;
+    soilEl.className = 'stat-value ' + (soilOK ? 'ok' : 'warn');
+    document.getElementById('soilDot').className = 'pulse-badge' + (soilOK ? '' : ' warn');
+    document.getElementById('soilPct').textContent = d.soil + '% moisture';
+    document.getElementById('soilVal').textContent = d.soil + ' %';
+    document.getElementById('soilBar').style.width = d.soil + '%';
+
     const ledOn = d.led === 'ON';
     const ledEl = document.getElementById('ledStatus');
     ledEl.textContent = d.led;
@@ -878,6 +934,8 @@ void handleData() {
   json += "\"ax\":" + String(ax, 2) + ",";
   json += "\"ay\":" + String(ay, 2) + ",";
   json += "\"az\":" + String(az, 2) + ",";
+  json += "\"soil\":" + String(soilPct) + ",";
+  json += "\"soilStatus\":\"" + String(soilAlertSent ? "HIGH" : "Normal") + "\",";
   json += "\"led\":\"" + String(digitalRead(LED_PIN) ? "ON" : "OFF") + "\",";
   json += "\"alertActive\":" + String(alertActive ? "true" : "false") + ",";
   json += "\"alertTitle\":\"" + jsonSafe(lastAlertType) + "\",";
@@ -906,7 +964,7 @@ void setup() {
   Serial.begin(115200);
   Serial.println("========================================");
   Serial.println("   COMPLETE ALERT DETECTION SYSTEM");
-  Serial.println("   VIBRATION + TILT + MPU6050 + OLED + WEB");
+  Serial.println("   VIBRATION + TILT + MPU6050 + SOIL + OLED + WEB");
   Serial.println("========================================\n");
 
   initOLED();
@@ -944,9 +1002,10 @@ void setup() {
     Serial.println("\nWiFi Failed! Time and dashboard unavailable.");
   }
 
-  // ===== SW-180P Pin Setup (BEFORE MPU init so pullup is stable) =====
+  // ===== Pin Setup (BEFORE MPU init so pullup is stable) =====
   pinMode(KNOCK_PIN, INPUT_PULLUP);   // SW-180P: stable = HIGH
   pinMode(TILT_PIN, INPUT_PULLUP);    // Tilt reversed logic (LOW = tilted)
+  pinMode(SOIL_PIN, INPUT);           // Soil moisture analog input
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -968,6 +1027,9 @@ void setup() {
     prevAz = az;
   }
 
+  // Initial soil reading so dashboard/OLED show a value right away
+  soilPct = readSoilPercent();
+
   bt.begin("Alert_System");
   bt.setTimeout(50);
   Serial.println("Bluetooth Started: Alert_System");
@@ -975,14 +1037,15 @@ void setup() {
   bt.println("========================================");
   bt.println("   COMPLETE ALERT DETECTION SYSTEM");
   bt.println("========================================");
-  bt.println("D12: SW-180P Vibration Sensor");
-  bt.println("D5:  Land Tilt (1.5 sec delay) - REVERSED (LOW=Tilt)");
+  bt.println("SW-180P: Vibration Sensor (pin " + String(KNOCK_PIN) + ")");
+  bt.println("Tilt: Land Tilt (1.5 sec delay) - REVERSED (LOW=Tilt)");
   if (mpuInitialized) {
     bt.println("MPU6050: Sudden Movement");
     bt.println("   Threshold: " + String(MPU_THRESHOLD) + "g");
   } else {
     bt.println("MPU6050: NOT DETECTED!");
   }
+  bt.println("Soil: Alert at >= " + String(SOIL_THRESHOLD_PCT) + "% moisture");
   bt.println("Buzzer: Active on alerts (pin " + String(BUZZER_PIN) + ")");
   if (WiFi.status() == WL_CONNECTED) {
     bt.println("Dashboard: http://" + WiFi.localIP().toString() + "/");
@@ -992,11 +1055,12 @@ void setup() {
   bt.println("========================================");
 
   Serial.println("\nSystem Ready!");
-  Serial.println("D12: SW-180P Vibration Detection");
-  Serial.println("D5:  Land Tilt Detection (1.5 sec delay) - REVERSED (LOW=Tilt)");
+  Serial.println("SW-180P: Vibration Detection");
+  Serial.println("Tilt: Land Tilt Detection (1.5 sec delay) - REVERSED (LOW=Tilt)");
   if (mpuInitialized) {
     Serial.println("MPU6050: Sudden Movement Detection");
   }
+  Serial.println("Soil: High Moisture Detection (>= " + String(SOIL_THRESHOLD_PCT) + "%)");
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("Dashboard: http://" + WiFi.localIP().toString() + "/");
   }
@@ -1008,7 +1072,7 @@ void setup() {
 }
 
 void loop() {
-  // ===== 1. SW-180P VIBRATION SENSOR (D12) =====
+  // ===== 1. SW-180P VIBRATION SENSOR =====
   // Multi-sample verification: real vibration produces multiple pulses
   // within a short window; light taps produce only 1-2 pulses.
   if (millis() - lastKnockCheck >= KNOCK_CHECK_INTERVAL) {
@@ -1022,7 +1086,7 @@ void loop() {
       if (millis() - lastNotif > KNOCK_ALERT_COOLDOWN) {
         sendAlert(
           "HEAVY VIBRATION DETECTED!",
-          "SW-180P Vibration Sensor (D12)",
+          "SW-180P Vibration Sensor",
           "Immediate inspection required",
           "VIBRATION!",
           "Inspect area now!",
@@ -1036,7 +1100,7 @@ void loop() {
     lastKnockCheck = millis();
   }
 
-  // ===== 2. TILT SENSOR (D5) - REVERSED LOGIC =====
+  // ===== 2. TILT SENSOR - REVERSED LOGIC =====
   int currentTiltState = digitalRead(TILT_PIN);
   if (currentTiltState == LOW) {
     if (tiltStartTime == 0) {
@@ -1050,7 +1114,7 @@ void loop() {
       if (millis() - lastTiltNotif > 3000) {
         sendAlert(
           "THE LAND IS TILTED!",
-          "Mercury Tilt Sensor (D5)",
+          "Mercury Tilt Sensor",
           "Check land stability immediately",
           "LAND TILTED",
           "Check stability now!",
@@ -1065,7 +1129,7 @@ void loop() {
       if (millis() - lastTiltNotif > 3000) {
         sendAlert(
           "LAND IS LEVEL AGAIN",
-          "Mercury Tilt Sensor (D5)",
+          "Mercury Tilt Sensor",
           "No action needed",
           "LEVEL AGAIN",
           "No action needed",
@@ -1107,11 +1171,43 @@ void loop() {
     lastMPURead = millis();
   }
 
+  // ===== 4. SOIL MOISTURE =====
+  // Alert when moisture stays >= threshold for SOIL_VERIFY_TIME.
+  // Re-arms only after it drops 5% below the threshold (hysteresis).
+  if (millis() - lastSoilRead >= SOIL_CHECK_INTERVAL) {
+    lastSoilRead = millis();
+    soilPct = readSoilPercent();
+    // Serial.println("Soil raw: " + String(soilRaw) + "  pct: " + String(soilPct));  // uncomment to calibrate
+
+    if (soilPct >= SOIL_THRESHOLD_PCT) {
+      if (soilHighStart == 0) soilHighStart = millis();
+      if (!soilAlertSent && millis() - soilHighStart >= SOIL_VERIFY_TIME) {
+        soilAlertSent = true;
+        digitalWrite(LED_PIN, HIGH);
+        if (lastSoilNotif == 0 || millis() - lastSoilNotif > SOIL_ALERT_COOLDOWN) {
+          sendAlert(
+            "HIGH SOIL MOISTURE!",
+            "Soil Moisture Sensor (" + String(soilPct) + "%)",
+            "Soil saturated - landslide risk, inspect area",
+            "HIGH MOISTURE",
+            "Soil saturated!",
+            "💧",
+            "🌧️"
+          );
+          lastSoilNotif = millis();
+        }
+      }
+    } else if (soilPct < SOIL_THRESHOLD_PCT - 5) {
+      soilAlertSent = false;
+      soilHighStart = 0;
+    }
+  }
+
   // ===== BUZZER UPDATE =====
   updateBuzzer();
 
   // ===== LED OFF AFTER TIMEOUT =====
-  if (millis() - lastKnock > 300 && !tiltAlertSent && !mpuAlertSent) {
+  if (millis() - lastKnock > 300 && !tiltAlertSent && !mpuAlertSent && !soilAlertSent) {
     digitalWrite(LED_PIN, LOW);
   }
 
@@ -1150,14 +1246,14 @@ void loop() {
       bt.println("Status: RUNNING");
       bt.println("Device: ESP32");
       bt.println("========================================");
-      bt.println("D12 (Vibration): " + String(digitalRead(KNOCK_PIN) == LOW ? "VIBRATION" : "Normal"));
+      bt.println("Vibration: " + String(digitalRead(KNOCK_PIN) == LOW ? "VIBRATION" : "Normal"));
       if (tiltAlertSent) {
-        bt.println("D5 (Tilt): TILTED (Verified) - REVERSED LOGIC");
+        bt.println("Tilt: TILTED (Verified) - REVERSED LOGIC");
       } else if (isTilted) {
         unsigned long elapsed = millis() - tiltStartTime;
-        bt.println("D5 (Tilt): Verifying... " + String(elapsed / 1000) + "s / 1.5s");
+        bt.println("Tilt: Verifying... " + String(elapsed / 1000) + "s / 1.5s");
       } else {
-        bt.println("D5 (Tilt): LEVEL");
+        bt.println("Tilt: LEVEL");
       }
       if (mpuInitialized) {
         bt.println("========================================");
@@ -1166,6 +1262,9 @@ void loop() {
         bt.println("   Threshold: " + String(MPU_THRESHOLD) + "g");
         bt.println(mpuAlertSent ? "   ALERT: Sudden Movement Detected!" : "   Status: Normal");
       }
+      bt.println("========================================");
+      bt.println("Soil Moisture: " + String(soilPct) + "% (raw " + String(soilRaw) + ")");
+      bt.println(soilAlertSent ? "   ALERT: High moisture!" : "   Status: Normal");
       bt.println("========================================");
       bt.println("LED: " + String(digitalRead(LED_PIN) ? "ON" : "OFF"));
       bt.println("========================================");
@@ -1212,6 +1311,16 @@ void loop() {
         bt.println("MPU6050 Not Detected!");
       }
     }
+    else if (c == "soil" || c == "SOIL") {
+      bt.println("========================================");
+      bt.println("SOIL MOISTURE");
+      bt.println("========================================");
+      bt.println("Moisture: " + String(soilPct) + "%");
+      bt.println("Raw ADC: " + String(soilRaw));
+      bt.println("Threshold: " + String(SOIL_THRESHOLD_PCT) + "%");
+      bt.println(soilAlertSent ? "ALERT: High moisture!" : "Status: Normal");
+      bt.println("========================================");
+    }
     else if (c == "time" || c == "TIME") {
       if (timeOK) {
         bt.println("========================================");
@@ -1228,22 +1337,23 @@ void loop() {
       }
     }
     else if (c == "d4" || c == "D4" || c == "d12" || c == "D12") {
-      bt.println("D12 (SW-180P): " + String(digitalRead(KNOCK_PIN) == LOW ? "VIBRATION" : "Normal"));
+      bt.println("SW-180P: " + String(digitalRead(KNOCK_PIN) == LOW ? "VIBRATION" : "Normal"));
     }
     else if (c == "d5" || c == "D5") {
       if (tiltAlertSent) {
-        bt.println("D5 (Tilt): TILTED (Verified for 1.5s) - REVERSED LOGIC");
+        bt.println("Tilt: TILTED (Verified for 1.5s) - REVERSED LOGIC");
       } else if (isTilted) {
         unsigned long elapsed = millis() - tiltStartTime;
-        bt.println("D5 (Tilt): Verifying... " + String(elapsed / 1000) + "s / 1.5s");
+        bt.println("Tilt: Verifying... " + String(elapsed / 1000) + "s / 1.5s");
       } else {
-        bt.println("D5 (Tilt): LEVEL");
+        bt.println("Tilt: LEVEL");
       }
     }
     else if (c == "threshold" || c == "THRESHOLD") {
       bt.println("MPU6050 Threshold: " + String(MPU_THRESHOLD) + "g");
       bt.println("Lower = More Sensitive");
       bt.println("Higher = Less Sensitive");
+      bt.println("Soil Threshold: " + String(SOIL_THRESHOLD_PCT) + "%");
     }
     else if (c == "wifi" || c == "WIFI") {
       if (WiFi.status() == WL_CONNECTED) {
@@ -1273,6 +1383,9 @@ void loop() {
       tiltAlertSent = false;
       mpuAlertSent = false;
       mpuAlertUntil = 0;
+      soilAlertSent = false;
+      soilHighStart = 0;
+      lastSoilNotif = 0;
       oledShowingAlert = false;
       oledShowingStatus = false;
       digitalWrite(LED_PIN, LOW);
@@ -1285,10 +1398,11 @@ void loop() {
       bt.println("========================================");
       bt.println("  status     - System status (+ shows on OLED)");
       bt.println("  mpu        - MPU6050 data");
+      bt.println("  soil       - Soil moisture data");
       bt.println("  time       - Show Indian time (IST)");
       bt.println("  d4 / d12   - Check SW-180P vibration sensor");
-      bt.println("  d5         - Check Tilt sensor (D5)");
-      bt.println("  threshold  - Show MPU threshold");
+      bt.println("  d5         - Check Tilt sensor");
+      bt.println("  threshold  - Show thresholds");
       bt.println("  wifi       - Show WiFi + dashboard link (+ OLED)");
       bt.println("  led on     - Turn LED ON");
       bt.println("  led off    - Turn LED OFF");
@@ -1297,8 +1411,8 @@ void loop() {
       bt.println("========================================");
       bt.println("TILT DELAY: 1.5 seconds");
       bt.println("Tilt Logic: REVERSED (LOW = Tilted)");
-      bt.println("Vibration: SW-180P on D12");
       bt.println("MPU THRESHOLD: " + String(MPU_THRESHOLD) + "g");
+      bt.println("SOIL THRESHOLD: " + String(SOIL_THRESHOLD_PCT) + "%");
       bt.println("========================================");
     }
     else if (c != "") {
