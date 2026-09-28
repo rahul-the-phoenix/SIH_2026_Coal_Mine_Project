@@ -6,10 +6,10 @@
 #include <MPU6050_tockn.h>
 #include <U8g2lib.h>
 
-const char* ssid = "Me";
-const char* password = "password";
+const char* ssid = "Me";   //my wifi name 
+const char* password = "password";   //my wifi password
 
-const char* ntpServer = "pool.ntp.org";
+const char* ntpServer = "pool.ntp.org";    //server 
 const long gmtOffset_sec = 19800;
 
 // Pin Definitions
